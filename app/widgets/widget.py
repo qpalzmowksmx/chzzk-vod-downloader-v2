@@ -1,7 +1,7 @@
 import os
 import re
 import threading
-from PySide6.QtWidgets import QWidget, QPushButton, QMessageBox, QFileDialog, QHBoxLayout, QSizePolicy
+from PySide6.QtWidgets import QWidget, QMenu, QPushButton, QMessageBox, QFileDialog, QHBoxLayout, QSizePolicy
 from PySide6.QtGui import QPainter, QPainterPath, QPixmap, QDesktopServices, QRegion
 from PySide6.QtCore import Qt, Signal, QUrl, QDir, QProcess, QRectF
 from app.viewmodels.data import ContentItem
@@ -129,6 +129,9 @@ class ContentItemWidget(QWidget, Ui_ContentItemWidget):
     textChanged = Signal(str)
     deleteRequest = Signal()
     pauseRequest = Signal()   # 진행 카드의 ⏸ (#245 상태별 조작)
+    freshRequest = Signal()
+    resumeRequest = Signal()
+    discardResumeRequest = Signal()
     retryRequest = Signal()   # 실패 카드의 ↻ (#245 상태별 조작)
     expandedChanged = Signal(bool)  # 해상도 펼침/접힘 — 목록이 "한 번에 하나"를 맞춘다
 
@@ -265,6 +268,11 @@ class ContentItemWidget(QWidget, Ui_ContentItemWidget):
         self.deleteButton.setHoverToken("stateFailed")
         self.pauseButton.setIconName("pause")
         self.retryButton.setIconName("retry")
+        self.resumeButton = QPushButton(self)
+        self.resumeButton.setObjectName("resumeDownloadButton")
+        self.topLayout.insertWidget(self.topLayout.indexOf(self.deleteButton), self.resumeButton)
+        self.resumeButton.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.resumeButton.customContextMenuRequested.connect(self._resumeMenu)
         self.openDirectoryButton.setIconName("folder")
         self.setIndex(self.index)  # 인덱스 업데이트
         self.titleLabel.setText(self.item.title) # 제목 업데이트
@@ -288,6 +296,20 @@ class ContentItemWidget(QWidget, Ui_ContentItemWidget):
         self.openDirectoryButton.clicked.connect(self.requestOpenDir)
         self.pauseButton.clicked.connect(self.pauseRequest.emit)
         self.retryButton.clicked.connect(self.retryRequest.emit)
+        self.resumeButton.clicked.connect(self.resumeRequest.emit)
+
+    def _resumeMenu(self, point):
+        """복구 파일의 삭제는 별도의 명시적인 동작으로 제공한다."""
+        menu = QMenu(self)
+        fresh = menu.addAction(self.tr("Keep fragments and start over"))
+        fresh.setEnabled(not self.item.retry_pending)
+        action = menu.addAction(self.tr("Delete saved fragments…"))
+        action.setEnabled(self.item.resume_available and not self.item.retry_pending)
+        selected = menu.exec(self.resumeButton.mapToGlobal(point))
+        if selected == action:
+            self.discardResumeRequest.emit()
+        elif selected == fresh:
+            self.freshRequest.emit()
 
     def addRepresentationButtons(self):
         """
@@ -317,15 +339,23 @@ class ContentItemWidget(QWidget, Ui_ContentItemWidget):
         )
         for unique_rep in self.item.unique_reps:
             # 크기 조회가 끝나기 전 표시 — "Unknown"은 실패로 읽혀 "확인 중"으로 표기 (#124)
-            unique_rep.append(self.tr("Checking..."))  # 초기 값 설정
+            if len(unique_rep) == 2:
+                unique_rep.append(self.tr("Checking..."))  # 초기 값 설정
 
         for index, (resolution, base_url, _) in enumerate(self.item.unique_reps):
             self.addRepresentationButton(resolution, base_url, index)
+        selected_index = 0
+        if getattr(self.item, "keep_selection", False):
+            self._userPicked = True
+            for index, rep in enumerate(self.item.unique_reps):
+                if str(rep[0]) == str(self.item.resolution) and getattr(rep, "stream", None) == self.item.stream:
+                    selected_index = index
+                    break
 
         # 기본 선택 = 최고 해상도 = 내림차순의 첫 pill. 버튼을 넘겨 선택
         # 표시(비활성=채움)까지 바로 건다 — 크기 조회가 끝나기 전에도 무엇이
         # 골라져 있는지 보여야 하고, 그래야 카드마다 선택 x가 한 줄로 선다.
-        self.setresolutionUrlSize(self.item.unique_reps[0][0], self.item.unique_reps[0][1], 0, self.buttons[0])
+        self.setresolutionUrlSize(self.item.unique_reps[selected_index][0], self.item.unique_reps[selected_index][1], selected_index, self.buttons[selected_index])
 
         # pill(높이 pillHeight)이 3행에 꽂히면 컨텐츠 열이 몇 px 자랄 수
         # 있다 — 썸네일이 그 높이를 계속 가득 채우도록 다시 맞춘다(#244).
@@ -565,6 +595,10 @@ class ContentItemWidget(QWidget, Ui_ContentItemWidget):
                 if button is not self._selectedButton:
                     self._selectedButton = button
                     self._layoutRowThree()  # 접힘이면 보이는 pill이 바뀐다
+            next_stream = getattr(self.item.unique_reps[index], "stream", None) if index is not None else self.item.stream
+            if (str(self.item.resolution), self.item.stream) != (str(resolution), next_stream):
+                self.item.output_path = ""
+                self.item.resume_available = self.item.merge_only = False
             self.item.resolution = resolution
             self.item.base_url = base_url
             if index is not None:
@@ -577,6 +611,8 @@ class ContentItemWidget(QWidget, Ui_ContentItemWidget):
                 # 패딩 관례가 #245에서 걷힐 때 이 한 줄만 남아, 글꼴에 따라 확보 폭
                 # (_reserveFileSizeWidth 후보에 없는 형태)을 넘어 아이콘을 밀었다 (#280).
                 self.fileSizeLabel.setText(f"{self.item.unique_reps[index][-1]}")
+
+            self.textChanged.emit(str(resolution))
 
     def loadImageFromUrl(self, label, url, maxHeight, type):
         """
@@ -731,20 +767,22 @@ class ContentItemWidget(QWidget, Ui_ContentItemWidget):
         self._refreshPathLabel()
 
         if self.item.downloadState == ItemState.LOADING:
-            self.statusLabel.setText(self.tr("Loading information..."))
+            self.statusLabel.setText(self.tr("Checking saved fragments…") if self.item.needs_refresh else self.tr("Loading information..."))
             self.fileSizeLabel.setText("")
 
         elif self.item.downloadState == DownloadState.WAITING:
             # 슬롯은 해상도 pill이 차지한다 — statusLabel은 숨겨지지만
             # 값은 유지한다(테스트·툴팁 등 텍스트 조회 경로 보존)
-            self.statusLabel.setText(self.tr("Download waiting"))
+            self.statusLabel.setText(self.tr("Resume queued") if item.retry_pending else (item.stateMessage or self.tr("Download waiting")))
             if self.item.is_segment_based:
                 self.fileSizeLabel.setText(strftime('%H:%M:%S', gmtime(item.duration)))
             else:
                 self.fileSizeLabel.setText(f"{item.total_size}")
 
         elif self.item.downloadState == DownloadState.RUNNING:
-            if self.item.is_segment_based and self.item.post_process:
+            if self.item.resume_available and not self.item.resume_summary and not self.item.post_process:
+                self.statusLabel.setText(self.tr("Checking saved fragments…"))
+            elif self.item.is_segment_based and self.item.post_process:
                 # "13% · 후처리 중" — 후처리 진행률(download_progress는 후처리에서
                 # 0부터 다시 차오른다)을 **앞에** 둔다. 전송 "42% · …"·일시정지
                 # "13% · 일시정지됨"과 자리를 맞춰 상태가 바뀌어도 퍼센트 위치가
@@ -758,6 +796,7 @@ class ContentItemWidget(QWidget, Ui_ContentItemWidget):
                     + self.tr("{0} left").format(remain)
                 )
             self.fileSizeLabel.setText(self._withResolution(self._sizeText(item)))
+            self.statusLabel.setToolTip(item.resume_summary)
 
         elif self.item.downloadState == DownloadState.PAUSED:
             # 진행분이 먼저, 상태가 뒤 — "54% · 일시정지됨". 진행 슬롯과 같은
@@ -819,7 +858,7 @@ class ContentItemWidget(QWidget, Ui_ContentItemWidget):
 
     def _slotShowsPills(self) -> bool:
         """3행 슬롯에 해상도 pill이 보이는 상태인가 — 대기(선택의 시간)만이다."""
-        return self.item.downloadState == DownloadState.WAITING
+        return self.item.downloadState == DownloadState.WAITING and not self.item.retry_pending and not self.item.stateMessage
 
     def _hasProgress(self) -> bool:
         """진행분이 있는 상태인가 — 진행·일시정지. 진행바는 이때만 보인다.
@@ -867,7 +906,7 @@ class ContentItemWidget(QWidget, Ui_ContentItemWidget):
             self.statusLabel.setProperty("state", state)
             theme.repolish(self.statusLabel)
 
-        self.statusLabel.setVisible(not self._slotShowsPills())
+        self.statusLabel.setVisible(not self._slotShowsPills() or self.item.retry_pending or bool(self.item.stateMessage))
         self._applyEditability()
 
         self.pauseButton.setVisible(raw in (DownloadState.RUNNING, DownloadState.PAUSED))
@@ -878,7 +917,15 @@ class ContentItemWidget(QWidget, Ui_ContentItemWidget):
             self.pauseButton.setIconName("pause")
             self.pauseButton.setToolTip(self.tr("Pause"))
         self.openDirectoryButton.setVisible(raw == DownloadState.FINISHED)
-        self.retryButton.setVisible(raw == DownloadState.FAILED)
+        resumable = self.item.content_type == "m3u8"
+        visible = resumable and (raw == DownloadState.FAILED or (
+            raw == DownloadState.WAITING and self.item.resume_available))
+        self.resumeButton.setVisible(visible)
+        self.resumeButton.setEnabled(not self.item.retry_pending)
+        self.resumeButton.setText(self.tr("Retry merge") if self.item.merge_only else (
+            self.tr("Resume download") if self.item.resume_available else self.tr("Download again")))
+        self.resumeButton.setToolTip((self.item.resume_summary + "\n" if self.item.resume_summary else "") + self.tr("Check saved fragments and resume. Right-click for saved data options."))
+        self.retryButton.setVisible(raw == DownloadState.FAILED and not resumable)
         self.fileSizeLabel.setVisible(raw != DownloadState.FAILED)
         self._reserveFileSizeWidth()  # 우측 군집 폭을 먼저 확보 — 크기·시간은 잘리지 않는다
         self._updatePathVisibility()  # → _layoutRowThree: pill 모드·경로 모양을 한 곳에서
@@ -1177,6 +1224,9 @@ class ContentItemWidget(QWidget, Ui_ContentItemWidget):
             # 고른 폴더는 버린다(#244 P-5 감사 칸). 시작 시점에 확정된 경로가 정답이다
             logger.info("카드 저장 경로 변경 무시 — 대화상자 중 상태가 %s로 바뀜", self.item.downloadState)
             return
+        if self.item.download_path != chosen:
+            self.item.output_path = ""
+            self.item.resume_available = self.item.merge_only = False
         self.item.download_path = chosen
         self._refreshPathLabel()
         self._updatePathVisibility()

@@ -122,6 +122,11 @@ def temp_dir_for(output_path: str, base_dir: str | None = None) -> str:
     return os.path.join(directory, f"CVDv2_temp_{stem}")
 
 
+def resume_dir_for(output_path: str, identity: str) -> str:
+    """출력 폴더 안에 제목과 무관한 영구 복구 폴더 경로를 만든다."""
+    return os.path.join(os.path.dirname(os.path.abspath(output_path)), ".cvdv2-resume", identity)
+
+
 # 임시 폴더를 분리할 스크래치 볼륨에 요구하는 최소 여유 공간 (#192).
 # m3u8·hls_aes는 산출물 크기를 미리 모른다(DownloadPlan.total_size=None) —
 # 정확한 소요량을 계산할 방법이 없으므로, 대부분의 VOD보다 넉넉한 고정

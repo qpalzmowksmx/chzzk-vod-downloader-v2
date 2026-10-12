@@ -1,5 +1,6 @@
 from core.api.representations import file_tag, is_original, shown_frame_rate
 from core.models.download_state import DownloadState
+from uuid import uuid4
 
 # 세그먼트 단위로 받는 타입 — 전체 크기를 미리 알 수 없어 진행률·표시가
 # 세그먼트 수 기반이다 (m3u8: 라이브 다시보기, hls_aes: AES 암호화 VOD #57)
@@ -11,6 +12,13 @@ class ContentItem:
 
     def __init__(self, vod_url, metadata, unique_reps, resolution, base_url, download_path, content_type, liveRewindPlaybackJson):
         self.vod_url = vod_url
+        self.queue_id = uuid4().hex
+        self.needs_refresh = False
+        self.resume_available = False
+        self.merge_only = False
+        self.retry_pending = False
+        self.last_state = "WAITING"
+        self.resume_summary = ""
         
         self.default_title = metadata.get('title', 'Unknown Title')
         self.title = self.default_title
